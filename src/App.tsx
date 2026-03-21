@@ -1,56 +1,39 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { supabase } from './lib/supabase';
 
 type ViewMode = 'plans' | 'clients';
 
-interface Plan {
+interface PlanRecord {
   id: string;
   name: string;
   price: number;
-  createdAt: string;
+  created_at: string;
+  active: boolean;
 }
 
-interface Customer {
+interface CustomerRecord {
   id: string;
   name: string;
-  planId: string;
-  dueDate: string;
+  plan_id: string;
+  due_date: string;
   contact: string;
-  createdAt: string;
-}
-
-const PLANS_STORAGE_KEY = 'admin-panel:plans';
-const CUSTOMERS_STORAGE_KEY = 'admin-panel:customers';
-const SESSION_STORAGE_KEY = 'admin-panel:session';
-
-function loadRecords<T>(key: string): T[] {
-  if (typeof window === 'undefined') return [];
-
-  const raw = window.localStorage.getItem(key);
-  if (!raw) return [];
-
-  try {
-    const parsed = JSON.parse(raw) as T[];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveRecords<T>(key: string, value: T[]) {
-  window.localStorage.setItem(key, JSON.stringify(value));
+  created_at: string;
+  active: boolean;
 }
 
 export function App() {
-  const [isLogged, setIsLogged] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return false;
-    return window.sessionStorage.getItem(SESSION_STORAGE_KEY) === '1';
-  });
+  const [isLogged, setIsLogged] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [dataLoading, setDataLoading] = useState(false);
 
   const [login, setLogin] = useState({ email: '', password: '' });
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [screenError, setScreenError] = useState<string | null>(null);
+  const [userEmail, setUserEmail] = useState('');
 
-  const [plans, setPlans] = useState<Plan[]>(() => loadRecords<Plan>(PLANS_STORAGE_KEY));
-  const [customers, setCustomers] = useState<Customer[]>(() => loadRecords<Customer>(CUSTOMERS_STORAGE_KEY));
+  const [plans, setPlans] = useState<PlanRecord[]>([]);
+  const [customers, setCustomers] = useState<CustomerRecord[]>([]);
 
   const [mode, setMode] = useState<ViewMode>('plans');
 
@@ -59,36 +42,149 @@ export function App() {
 
   const [customerForm, setCustomerForm] = useState({
     name: '',
-    planId: '',
-    dueDate: '',
+    plan_id: '',
+    due_date: '',
     contact: '',
   });
   const [customerError, setCustomerError] = useState<string | null>(null);
 
   const plansById = useMemo(() => new Map(plans.map((plan) => [plan.id, plan])), [plans]);
 
-  const handleLogin = (event: React.FormEvent<HTMLFormElement>) => {
+  useEffect(() => {
+    let mounted = true;
+
+    const syncSession = async () => {
+      setSessionLoading(true);
+      const { data, error } = await supabase.auth.getSession();
+
+      if (!mounted) return;
+
+      if (error || !data.session) {
+        setIsLogged(false);
+        setIsAdmin(false);
+        setUserEmail('');
+        setPlans([]);
+        setCustomers([]);
+        setSessionLoading(false);
+        return;
+      }
+
+      setIsLogged(true);
+      setUserEmail(data.session.user.email ?? '');
+      await loadData(data.session.user.id);
+      if (mounted) setSessionLoading(false);
+    };
+
+    void syncSession();
+
+    const { data: listener } = supabase.auth.onAuthStateChange(async (
+      _event: unknown,
+      session: { user: { id: string; email?: string | null } } | null,
+    ) => {
+      if (!mounted) return;
+
+      if (!session) {
+        setIsLogged(false);
+        setIsAdmin(false);
+        setUserEmail('');
+        setPlans([]);
+        setCustomers([]);
+        return;
+      }
+
+      setIsLogged(true);
+      setUserEmail(session.user.email ?? '');
+      await loadData(session.user.id);
+    });
+
+    return () => {
+      mounted = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  async function loadData(userId: string) {
+    setDataLoading(true);
+    setScreenError(null);
+
+    const { data: adminRow, error: adminError } = await supabase
+      .from('admin_users')
+      .select('user_id')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (adminError) {
+      setIsAdmin(false);
+      setScreenError(adminError.message);
+      setDataLoading(false);
+      return;
+    }
+
+    if (!adminRow) {
+      setIsAdmin(false);
+      setScreenError('Seu usuário não está liberado em admin_users.');
+      setDataLoading(false);
+      return;
+    }
+
+    setIsAdmin(true);
+
+    const [{ data: plansData, error: plansError }, { data: customersData, error: customersError }] = await Promise.all([
+      supabase.from('admin_plans').select('id, name, price, active, created_at').order('created_at', { ascending: false }),
+      supabase.from('admin_customers').select('id, name, plan_id, due_date, contact, active, created_at').order('created_at', { ascending: false }),
+    ]);
+
+    if (plansError) {
+      setScreenError(plansError.message);
+      setDataLoading(false);
+      return;
+    }
+
+    if (customersError) {
+      setScreenError(customersError.message);
+      setDataLoading(false);
+      return;
+    }
+
+    setPlans(plansData ?? []);
+    setCustomers(customersData ?? []);
+    setDataLoading(false);
+  }
+
+  const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     const email = login.email.trim().toLowerCase();
     const password = login.password;
 
-    if (email !== 'admin@virtualizze.com' || password !== 'admin123') {
-      setLoginError('Credenciais inválidas. Use admin@virtualizze.com / admin123');
+    if (!email || !password) {
+      setLoginError('Preencha e-mail e senha.');
       return;
     }
 
-    window.sessionStorage.setItem(SESSION_STORAGE_KEY, '1');
+    const { error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (error) {
+      setLoginError(error.message);
+      return;
+    }
+
     setLoginError(null);
-    setIsLogged(true);
   };
 
-  const handleLogout = () => {
-    window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
     setIsLogged(false);
+    setIsAdmin(false);
+    setPlans([]);
+    setCustomers([]);
+    setUserEmail('');
   };
 
-  const handleCreatePlan = (event: React.FormEvent<HTMLFormElement>) => {
+  const handleCreatePlan = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     const name = planForm.name.trim();
@@ -102,48 +198,86 @@ export function App() {
       return;
     }
 
-    const newPlan: Plan = {
-      id: `plan_${Date.now()}`,
+    const { data, error } = await supabase
+      .from('admin_plans')
+      .insert({
+        name,
+        price: Number(planForm.price),
+      })
+      .select('id, name, price, active, created_at')
+      .single();
+
+    if (error) {
+      setPlanError(error.message);
+      return;
+    }
+
+    const newPlan: PlanRecord = {
+      id: data.id,
       name,
-      price: Number(planForm.price),
-      createdAt: new Date().toISOString(),
+      price: Number(data.price),
+      active: data.active,
+      created_at: data.created_at,
     };
 
-    const nextPlans = [newPlan, ...plans];
-    setPlans(nextPlans);
-    saveRecords(PLANS_STORAGE_KEY, nextPlans);
+    setPlans((current) => [newPlan, ...current]);
 
     setPlanForm({ name: '', price: 0 });
     setPlanError(null);
   };
 
-  const handleCreateCustomer = (event: React.FormEvent<HTMLFormElement>) => {
+  const handleCreateCustomer = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     const name = customerForm.name.trim();
     const contact = customerForm.contact.trim();
 
-    if (!name || !customerForm.planId || !customerForm.dueDate || !contact) {
+    if (!name || !customerForm.plan_id || !customerForm.due_date || !contact) {
       setCustomerError('Preencha nome, plano, vencimento e contato.');
       return;
     }
 
-    const newCustomer: Customer = {
-      id: `customer_${Date.now()}`,
+    const { data, error } = await supabase
+      .from('admin_customers')
+      .insert({
+        name,
+        plan_id: customerForm.plan_id,
+        due_date: customerForm.due_date,
+        contact,
+      })
+      .select('id, name, plan_id, due_date, contact, active, created_at')
+      .single();
+
+    if (error) {
+      setCustomerError(error.message);
+      return;
+    }
+
+    const newCustomer: CustomerRecord = {
+      id: data.id,
       name,
-      planId: customerForm.planId,
-      dueDate: customerForm.dueDate,
+      plan_id: data.plan_id,
+      due_date: data.due_date,
       contact,
-      createdAt: new Date().toISOString(),
+      active: data.active,
+      created_at: data.created_at,
     };
 
-    const nextCustomers = [newCustomer, ...customers];
-    setCustomers(nextCustomers);
-    saveRecords(CUSTOMERS_STORAGE_KEY, nextCustomers);
+    setCustomers((current) => [newCustomer, ...current]);
 
-    setCustomerForm({ name: '', planId: '', dueDate: '', contact: '' });
+    setCustomerForm({ name: '', plan_id: '', due_date: '', contact: '' });
     setCustomerError(null);
   };
+
+  if (sessionLoading) {
+    return (
+      <main className="page page-login">
+        <section className="card login-card">
+          <p className="muted">Carregando sessão...</p>
+        </section>
+      </main>
+    );
+  }
 
   if (!isLogged) {
     return (
@@ -156,7 +290,7 @@ export function App() {
               <span>E-mail</span>
               <input
                 type="email"
-                placeholder="admin@virtualizze.com"
+                placeholder="seu@email.com"
                 value={login.email}
                 onChange={(event) => {
                   const value = event.currentTarget.value;
@@ -179,6 +313,10 @@ export function App() {
             </label>
 
             {loginError ? <p className="error">{loginError}</p> : null}
+
+            <p className="muted">
+              Entre com seu usuário do Supabase Auth que já está cadastrado em admin_users.
+            </p>
 
             <button className="btn" type="submit">
               Entrar
@@ -218,7 +356,26 @@ export function App() {
         </div>
       </header>
 
-      {mode === 'plans' ? (
+      <p className="muted" style={{ marginBottom: 12 }}>
+        Sessão: {userEmail || 'usuário autenticado'}
+      </p>
+
+      {screenError ? <p className="error" style={{ marginBottom: 12 }}>{screenError}</p> : null}
+
+      {!isAdmin ? (
+        <section className="card">
+          <h2>Acesso não liberado</h2>
+          <p className="muted">Adicione seu user_id na tabela public.admin_users para liberar o painel.</p>
+        </section>
+      ) : null}
+
+      {isAdmin && dataLoading ? (
+        <section className="card">
+          <p className="muted">Carregando dados...</p>
+        </section>
+      ) : null}
+
+      {isAdmin && !dataLoading && mode === 'plans' ? (
         <section className="grid">
           <article className="card">
             <h2>Novo plano</h2>
@@ -266,7 +423,7 @@ export function App() {
                 <div className="list-row" key={plan.id}>
                   <div>
                     <p className="strong">{plan.name}</p>
-                    <p className="muted">Criado em {new Date(plan.createdAt).toLocaleDateString('pt-BR')}</p>
+                    <p className="muted">Criado em {new Date(plan.created_at).toLocaleDateString('pt-BR')}</p>
                   </div>
                   <p className="price">R$ {plan.price.toFixed(2)}</p>
                 </div>
@@ -276,7 +433,9 @@ export function App() {
             </div>
           </article>
         </section>
-      ) : (
+      ) : null}
+
+      {isAdmin && !dataLoading && mode === 'clients' ? (
         <section className="grid">
           <article className="card">
             <h2>Novo cliente</h2>
@@ -297,10 +456,10 @@ export function App() {
               <label className="field">
                 <span>Plano</span>
                 <select
-                  value={customerForm.planId}
+                  value={customerForm.plan_id}
                   onChange={(event) => {
                     const value = event.currentTarget.value;
-                    setCustomerForm((current) => ({ ...current, planId: value }));
+                    setCustomerForm((current) => ({ ...current, plan_id: value }));
                   }}
                 >
                   <option value="">Selecione um plano</option>
@@ -316,10 +475,10 @@ export function App() {
                 <span>Data de vencimento</span>
                 <input
                   type="date"
-                  value={customerForm.dueDate}
+                  value={customerForm.due_date}
                   onChange={(event) => {
                     const value = event.currentTarget.value;
-                    setCustomerForm((current) => ({ ...current, dueDate: value }));
+                    setCustomerForm((current) => ({ ...current, due_date: value }));
                   }}
                 />
               </label>
@@ -353,13 +512,13 @@ export function App() {
             <h2>Clientes cadastrados</h2>
             <div className="stack list">
               {customers.map((customer) => {
-                const plan = plansById.get(customer.planId);
+                const plan = plansById.get(customer.plan_id);
 
                 return (
                   <div className="list-row list-row-column" key={customer.id}>
                     <p className="strong">{customer.name}</p>
                     <p className="muted">Plano: {plan?.name ?? 'Plano removido'}</p>
-                    <p className="muted">Vencimento: {new Date(`${customer.dueDate}T00:00:00`).toLocaleDateString('pt-BR')}</p>
+                    <p className="muted">Vencimento: {new Date(`${customer.due_date}T00:00:00`).toLocaleDateString('pt-BR')}</p>
                     <p className="muted">Contato: {customer.contact}</p>
                   </div>
                 );
@@ -369,7 +528,7 @@ export function App() {
             </div>
           </article>
         </section>
-      )}
+      ) : null}
     </main>
   );
 }
