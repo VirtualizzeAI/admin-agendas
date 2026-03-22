@@ -37,22 +37,6 @@ async function parseJsonSafe<T>(response: Response): Promise<T | null> {
   }
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timeoutId: ReturnType<typeof setTimeout> | null = null;
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
-  });
-
-  try {
-    return await Promise.race([promise, timeoutPromise]);
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
-  }
-}
-
-const REQUEST_TIMEOUT_MS = 10000;
-
 export function App() {
   const [isLogged, setIsLogged] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -94,123 +78,41 @@ export function App() {
   const plansById = useMemo(() => new Map(plans.map((plan) => [plan.id, plan])), [plans]);
 
   useEffect(() => {
-    let mounted = true;
-    let authChangeInFlight = false;
-
-    const syncSession = async () => {
+    const bootstrap = async () => {
       setSessionLoading(true);
-      try {
-        const { data, error } = await withTimeout(
-          supabase.auth.getSession(),
-          8000,
-          'Timeout ao carregar sessao. Tente entrar novamente.',
-        );
+      setScreenError(null);
 
-        if (!mounted) return;
+      const { data, error } = await supabase.auth.getSession();
 
-        if (error || !data.session) {
-          setIsLogged(false);
-          setIsAdmin(false);
-          setUserEmail('');
-          setPlans([]);
-          setCustomers([]);
-          return;
-        }
-
-        setIsLogged(true);
-        setUserEmail(data.session.user.email ?? '');
-        await loadData(data.session.user.id);
-      } catch (error) {
-        if (!mounted) return;
-
-        void supabase.auth.signOut({ scope: 'local' });
-
+      if (error || !data.session) {
         setIsLogged(false);
         setIsAdmin(false);
         setUserEmail('');
         setPlans([]);
         setCustomers([]);
-        setScreenError(error instanceof Error ? error.message : 'Falha ao validar sessao.');
-      } finally {
-        if (mounted) {
-          setSessionLoading(false);
-        }
+        setSessionLoading(false);
+        return;
       }
-    };
 
-    void syncSession();
-
-    const { data: listener } = supabase.auth.onAuthStateChange(async (
-      _event: unknown,
-      session: { user: { id: string; email?: string | null } } | null,
-    ) => {
-      if (!mounted) return;
-      if (authChangeInFlight) return;
-
-      try {
-        authChangeInFlight = true;
-
-        if (!session) {
-          setIsLogged(false);
-          setIsAdmin(false);
-          setUserEmail('');
-          setPlans([]);
-          setCustomers([]);
-          return;
-        }
-
-        setIsLogged(true);
-        setUserEmail(session.user.email ?? '');
-        await loadData(session.user.id);
-      } catch (error) {
-        if (!mounted) return;
-        setScreenError(error instanceof Error ? error.message : 'Falha ao atualizar sessao.');
-      } finally {
-        authChangeInFlight = false;
-        if (mounted) {
-          setSessionLoading(false);
-        }
-      }
-    });
-
-    return () => {
-      mounted = false;
-      listener.subscription.unsubscribe();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!sessionLoading) return;
-
-    const fallbackTimer = setTimeout(() => {
+      setIsLogged(true);
+      setUserEmail(data.session.user.email ?? '');
+      await loadData(data.session.user.id);
       setSessionLoading(false);
-      setIsLogged(false);
-      setIsAdmin(false);
-      setUserEmail('');
-      setPlans([]);
-      setCustomers([]);
-      setScreenError((current) => current ?? 'Sessao travada no navegador. Se persistir, limpe os dados do site e entre novamente.');
-    }, 12000);
+    };
 
-    return () => clearTimeout(fallbackTimer);
-  }, [sessionLoading]);
+    void bootstrap();
+  }, []);
 
   async function loadData(userId: string) {
     setDataLoading(true);
     setScreenError(null);
 
     try {
-      const { data: adminRow, error: adminError } = await withTimeout(
-        Promise.resolve(
-          supabase
-            .from('admin_users')
-            .select('user_id')
-            .eq('user_id', userId)
-            .maybeSingle(),
-        ),
-        REQUEST_TIMEOUT_MS,
-        'Timeout ao carregar permissao admin.',
-      );
+      const { data: adminRow, error: adminError } = await supabase
+        .from('admin_users')
+        .select('user_id')
+        .eq('user_id', userId)
+        .maybeSingle();
 
       if (adminError) {
         setIsAdmin(false);
@@ -226,29 +128,19 @@ export function App() {
 
       setIsAdmin(true);
 
-      const [{ data: plansData, error: plansError }, customersResult] = await withTimeout(
-        Promise.all([
-          supabase.from('admin_plans').select('id, name, price, active, created_at').order('created_at', { ascending: false }),
-          supabase.from('admin_customers').select('id, name, plan_id, due_date, contact, saas_email, saas_user_id, tenant_id, active, created_at').order('created_at', { ascending: false }),
-        ]),
-        REQUEST_TIMEOUT_MS,
-        'Timeout ao carregar planos e clientes.',
-      );
+      const [{ data: plansData, error: plansError }, customersResult] = await Promise.all([
+        supabase.from('admin_plans').select('id, name, price, active, created_at').order('created_at', { ascending: false }),
+        supabase.from('admin_customers').select('id, name, plan_id, due_date, contact, saas_email, saas_user_id, tenant_id, active, created_at').order('created_at', { ascending: false }),
+      ]);
 
       let customersData = customersResult.data;
       let customersError = customersResult.error;
 
       if (customersError?.message?.includes('column admin_customers.saas_email does not exist')) {
-        const legacyResult = await withTimeout(
-          Promise.resolve(
-            supabase
-              .from('admin_customers')
-              .select('id, name, plan_id, due_date, contact, active, created_at')
-              .order('created_at', { ascending: false }),
-          ),
-          REQUEST_TIMEOUT_MS,
-          'Timeout ao carregar clientes no modo legado.',
-        );
+        const legacyResult = await supabase
+          .from('admin_customers')
+          .select('id, name, plan_id, due_date, contact, active, created_at')
+          .order('created_at', { ascending: false });
 
         customersData = (legacyResult.data ?? []).map((item) => ({
           ...item,
@@ -296,7 +188,7 @@ export function App() {
       return;
     }
 
-    const { error } = await supabase.auth.signInWithPassword({
+    const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
@@ -306,7 +198,17 @@ export function App() {
       return;
     }
 
+    if (!data.session) {
+      setLoginError('Sessao nao retornada no login. Tente novamente.');
+      return;
+    }
+
+    setIsLogged(true);
+    setUserEmail(data.session.user.email ?? '');
     setLoginError(null);
+    setSessionLoading(true);
+    await loadData(data.session.user.id);
+    setSessionLoading(false);
   };
 
   const handleLogout = async () => {
