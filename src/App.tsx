@@ -17,9 +17,41 @@ interface CustomerRecord {
   plan_id: string;
   due_date: string;
   contact: string;
+  saas_email?: string | null;
+  saas_user_id?: string | null;
+  tenant_id?: string | null;
   created_at: string;
   active: boolean;
 }
+
+const API_URL = import.meta.env.VITE_API_URL as string | undefined;
+
+async function parseJsonSafe<T>(response: Response): Promise<T | null> {
+  const text = await response.text();
+  if (!text) return null;
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+const REQUEST_TIMEOUT_MS = 10000;
 
 export function App() {
   const [isLogged, setIsLogged] = useState(false);
@@ -45,34 +77,65 @@ export function App() {
     plan_id: '',
     due_date: '',
     contact: '',
+    saas_email: '',
+    saas_password: '',
   });
   const [customerError, setCustomerError] = useState<string | null>(null);
+  const [editingCustomerId, setEditingCustomerId] = useState<string | null>(null);
+  const [editingCustomerForm, setEditingCustomerForm] = useState({
+    name: '',
+    plan_id: '',
+    due_date: '',
+    contact: '',
+    saas_email: '',
+  });
+  const [customerActionLoading, setCustomerActionLoading] = useState<string | null>(null);
 
   const plansById = useMemo(() => new Map(plans.map((plan) => [plan.id, plan])), [plans]);
 
   useEffect(() => {
     let mounted = true;
+    let authChangeInFlight = false;
 
     const syncSession = async () => {
       setSessionLoading(true);
-      const { data, error } = await supabase.auth.getSession();
+      try {
+        const { data, error } = await withTimeout(
+          supabase.auth.getSession(),
+          8000,
+          'Timeout ao carregar sessao. Tente entrar novamente.',
+        );
 
-      if (!mounted) return;
+        if (!mounted) return;
 
-      if (error || !data.session) {
+        if (error || !data.session) {
+          setIsLogged(false);
+          setIsAdmin(false);
+          setUserEmail('');
+          setPlans([]);
+          setCustomers([]);
+          return;
+        }
+
+        setIsLogged(true);
+        setUserEmail(data.session.user.email ?? '');
+        await loadData(data.session.user.id);
+      } catch (error) {
+        if (!mounted) return;
+
+        void supabase.auth.signOut({ scope: 'local' });
+
         setIsLogged(false);
         setIsAdmin(false);
         setUserEmail('');
         setPlans([]);
         setCustomers([]);
-        setSessionLoading(false);
-        return;
+        setScreenError(error instanceof Error ? error.message : 'Falha ao validar sessao.');
+      } finally {
+        if (mounted) {
+          setSessionLoading(false);
+        }
       }
-
-      setIsLogged(true);
-      setUserEmail(data.session.user.email ?? '');
-      await loadData(data.session.user.id);
-      if (mounted) setSessionLoading(false);
     };
 
     void syncSession();
@@ -82,19 +145,32 @@ export function App() {
       session: { user: { id: string; email?: string | null } } | null,
     ) => {
       if (!mounted) return;
+      if (authChangeInFlight) return;
 
-      if (!session) {
-        setIsLogged(false);
-        setIsAdmin(false);
-        setUserEmail('');
-        setPlans([]);
-        setCustomers([]);
-        return;
+      try {
+        authChangeInFlight = true;
+
+        if (!session) {
+          setIsLogged(false);
+          setIsAdmin(false);
+          setUserEmail('');
+          setPlans([]);
+          setCustomers([]);
+          return;
+        }
+
+        setIsLogged(true);
+        setUserEmail(session.user.email ?? '');
+        await loadData(session.user.id);
+      } catch (error) {
+        if (!mounted) return;
+        setScreenError(error instanceof Error ? error.message : 'Falha ao atualizar sessao.');
+      } finally {
+        authChangeInFlight = false;
+        if (mounted) {
+          setSessionLoading(false);
+        }
       }
-
-      setIsLogged(true);
-      setUserEmail(session.user.email ?? '');
-      await loadData(session.user.id);
     });
 
     return () => {
@@ -103,52 +179,110 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!sessionLoading) return;
+
+    const fallbackTimer = setTimeout(() => {
+      setSessionLoading(false);
+      setIsLogged(false);
+      setIsAdmin(false);
+      setUserEmail('');
+      setPlans([]);
+      setCustomers([]);
+      setScreenError((current) => current ?? 'Sessao travada no navegador. Se persistir, limpe os dados do site e entre novamente.');
+    }, 12000);
+
+    return () => clearTimeout(fallbackTimer);
+  }, [sessionLoading]);
+
   async function loadData(userId: string) {
     setDataLoading(true);
     setScreenError(null);
 
-    const { data: adminRow, error: adminError } = await supabase
-      .from('admin_users')
-      .select('user_id')
-      .eq('user_id', userId)
-      .maybeSingle();
+    try {
+      const { data: adminRow, error: adminError } = await withTimeout(
+        Promise.resolve(
+          supabase
+            .from('admin_users')
+            .select('user_id')
+            .eq('user_id', userId)
+            .maybeSingle(),
+        ),
+        REQUEST_TIMEOUT_MS,
+        'Timeout ao carregar permissao admin.',
+      );
 
-    if (adminError) {
+      if (adminError) {
+        setIsAdmin(false);
+        setScreenError(adminError.message);
+        return;
+      }
+
+      if (!adminRow) {
+        setIsAdmin(false);
+        setScreenError('Seu usuário não está liberado em admin_users.');
+        return;
+      }
+
+      setIsAdmin(true);
+
+      const [{ data: plansData, error: plansError }, customersResult] = await withTimeout(
+        Promise.all([
+          supabase.from('admin_plans').select('id, name, price, active, created_at').order('created_at', { ascending: false }),
+          supabase.from('admin_customers').select('id, name, plan_id, due_date, contact, saas_email, saas_user_id, tenant_id, active, created_at').order('created_at', { ascending: false }),
+        ]),
+        REQUEST_TIMEOUT_MS,
+        'Timeout ao carregar planos e clientes.',
+      );
+
+      let customersData = customersResult.data;
+      let customersError = customersResult.error;
+
+      if (customersError?.message?.includes('column admin_customers.saas_email does not exist')) {
+        const legacyResult = await withTimeout(
+          Promise.resolve(
+            supabase
+              .from('admin_customers')
+              .select('id, name, plan_id, due_date, contact, active, created_at')
+              .order('created_at', { ascending: false }),
+          ),
+          REQUEST_TIMEOUT_MS,
+          'Timeout ao carregar clientes no modo legado.',
+        );
+
+        customersData = (legacyResult.data ?? []).map((item) => ({
+          ...item,
+          saas_email: null,
+          saas_user_id: null,
+          tenant_id: null,
+        }));
+        customersError = legacyResult.error;
+
+        if (!legacyResult.error) {
+          setScreenError('Schema desatualizado: faltam colunas SaaS em admin_customers. Execute a migracao SQL para habilitar edicao de e-mail e reset de senha.');
+        }
+      }
+
+      if (plansError) {
+        setScreenError(plansError.message);
+        return;
+      }
+
+      if (customersError) {
+        setScreenError(customersError.message);
+        return;
+      }
+
+      setPlans(plansData ?? []);
+      setCustomers(customersData ?? []);
+    } catch (error) {
       setIsAdmin(false);
-      setScreenError(adminError.message);
+      setPlans([]);
+      setCustomers([]);
+      setScreenError(error instanceof Error ? error.message : 'Erro ao carregar dados do painel.');
+    } finally {
       setDataLoading(false);
-      return;
     }
-
-    if (!adminRow) {
-      setIsAdmin(false);
-      setScreenError('Seu usuário não está liberado em admin_users.');
-      setDataLoading(false);
-      return;
-    }
-
-    setIsAdmin(true);
-
-    const [{ data: plansData, error: plansError }, { data: customersData, error: customersError }] = await Promise.all([
-      supabase.from('admin_plans').select('id, name, price, active, created_at').order('created_at', { ascending: false }),
-      supabase.from('admin_customers').select('id, name, plan_id, due_date, contact, active, created_at').order('created_at', { ascending: false }),
-    ]);
-
-    if (plansError) {
-      setScreenError(plansError.message);
-      setDataLoading(false);
-      return;
-    }
-
-    if (customersError) {
-      setScreenError(customersError.message);
-      setDataLoading(false);
-      return;
-    }
-
-    setPlans(plansData ?? []);
-    setCustomers(customersData ?? []);
-    setDataLoading(false);
   }
 
   const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -231,42 +365,215 @@ export function App() {
 
     const name = customerForm.name.trim();
     const contact = customerForm.contact.trim();
+    const saasEmail = customerForm.saas_email.trim().toLowerCase();
+    const saasPassword = customerForm.saas_password;
 
-    if (!name || !customerForm.plan_id || !customerForm.due_date || !contact) {
-      setCustomerError('Preencha nome, plano, vencimento e contato.');
+    if (!name || !customerForm.plan_id || !customerForm.due_date || !contact || !saasEmail || !saasPassword) {
+      setCustomerError('Preencha nome, plano, vencimento, contato, e-mail e senha SaaS.');
       return;
     }
 
-    const { data, error } = await supabase
-      .from('admin_customers')
-      .insert({
-        name,
-        plan_id: customerForm.plan_id,
-        due_date: customerForm.due_date,
-        contact,
-      })
-      .select('id, name, plan_id, due_date, contact, active, created_at')
-      .single();
-
-    if (error) {
-      setCustomerError(error.message);
+    if (!API_URL) {
+      setCustomerError('Defina VITE_API_URL no .env do admin-panel.');
       return;
     }
 
-    const newCustomer: CustomerRecord = {
-      id: data.id,
-      name,
-      plan_id: data.plan_id,
-      due_date: data.due_date,
-      contact,
-      active: data.active,
-      created_at: data.created_at,
-    };
+    if (saasPassword.length < 6) {
+      setCustomerError('A senha SaaS deve ter ao menos 6 caracteres.');
+      return;
+    }
 
-    setCustomers((current) => [newCustomer, ...current]);
+    const { data: sessionData } = await supabase.auth.getSession();
+    const accessToken = sessionData.session?.access_token;
 
-    setCustomerForm({ name: '', plan_id: '', due_date: '', contact: '' });
+    if (!accessToken) {
+      setCustomerError('Sessao expirada. Faca login novamente.');
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_URL}/v1/admin/customers`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          name,
+          plan_id: customerForm.plan_id,
+          due_date: customerForm.due_date,
+          contact,
+          saas_email: saasEmail,
+          saas_password: saasPassword,
+        }),
+      });
+
+      const payload = await parseJsonSafe<{
+        message?: string;
+        id?: string;
+        name?: string;
+        plan_id?: string;
+        due_date?: string;
+        contact?: string;
+        saas_email?: string;
+        saas_user_id?: string;
+        tenant_id?: string;
+        active?: boolean;
+        created_at?: string;
+      }>(response);
+
+      if (!response.ok) {
+        setCustomerError(payload?.message ?? 'Nao foi possivel criar cliente e acesso SaaS.');
+        return;
+      }
+
+      if (!payload?.id || !payload.name || !payload.plan_id || !payload.due_date || !payload.contact || !payload.created_at) {
+        setCustomerError('Resposta invalida do backend ao criar cliente.');
+        return;
+      }
+
+      const newCustomer: CustomerRecord = {
+        id: payload.id,
+        name: payload.name,
+        plan_id: payload.plan_id,
+        due_date: payload.due_date,
+        contact: payload.contact,
+        saas_email: payload.saas_email ?? saasEmail,
+        saas_user_id: payload.saas_user_id ?? null,
+        tenant_id: payload.tenant_id ?? null,
+        active: Boolean(payload.active),
+        created_at: payload.created_at,
+      };
+
+      setCustomers((current) => [newCustomer, ...current]);
+
+      setCustomerForm({ name: '', plan_id: '', due_date: '', contact: '', saas_email: '', saas_password: '' });
+      setCustomerError(null);
+    } catch (error) {
+      setCustomerError(error instanceof Error ? error.message : 'Erro inesperado ao criar cliente.');
+    }
+  };
+
+  const startEditingCustomer = (customer: CustomerRecord) => {
     setCustomerError(null);
+    setEditingCustomerId(customer.id);
+    setEditingCustomerForm({
+      name: customer.name,
+      plan_id: customer.plan_id,
+      due_date: customer.due_date,
+      contact: customer.contact,
+      saas_email: customer.saas_email ?? '',
+    });
+  };
+
+  const cancelEditingCustomer = () => {
+    setEditingCustomerId(null);
+    setEditingCustomerForm({
+      name: '',
+      plan_id: '',
+      due_date: '',
+      contact: '',
+      saas_email: '',
+    });
+  };
+
+  const handleSaveCustomerEdit = async (customerId: string) => {
+    if (!API_URL) {
+      setCustomerError('Defina VITE_API_URL no .env do admin-panel.');
+      return;
+    }
+
+    const name = editingCustomerForm.name.trim();
+    const contact = editingCustomerForm.contact.trim();
+    const saasEmail = editingCustomerForm.saas_email.trim().toLowerCase();
+
+    if (!name || !editingCustomerForm.plan_id || !editingCustomerForm.due_date || !contact || !saasEmail) {
+      setCustomerError('Preencha nome, plano, vencimento, contato e e-mail SaaS no modo edicao.');
+      return;
+    }
+
+    const { data: sessionData } = await supabase.auth.getSession();
+    const accessToken = sessionData.session?.access_token;
+    if (!accessToken) {
+      setCustomerError('Sessao expirada. Faca login novamente.');
+      return;
+    }
+
+    setCustomerActionLoading(customerId);
+
+    try {
+      const response = await fetch(`${API_URL}/v1/admin/customers/${customerId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          name,
+          plan_id: editingCustomerForm.plan_id,
+          due_date: editingCustomerForm.due_date,
+          contact,
+          saas_email: saasEmail,
+        }),
+      });
+
+      const payload = await parseJsonSafe<{
+        message?: string;
+        record?: CustomerRecord;
+      }>(response);
+
+      if (!response.ok || !payload?.record) {
+        setCustomerError(payload?.message ?? 'Nao foi possivel atualizar o cliente.');
+        return;
+      }
+
+      setCustomers((current) => current.map((item) => (item.id === customerId ? { ...item, ...payload.record } : item)));
+      cancelEditingCustomer();
+      setCustomerError(null);
+    } catch (error) {
+      setCustomerError(error instanceof Error ? error.message : 'Erro inesperado ao atualizar cliente.');
+    } finally {
+      setCustomerActionLoading(null);
+    }
+  };
+
+  const handleSendResetPassword = async (customerId: string) => {
+    if (!API_URL) {
+      setCustomerError('Defina VITE_API_URL no .env do admin-panel.');
+      return;
+    }
+
+    const { data: sessionData } = await supabase.auth.getSession();
+    const accessToken = sessionData.session?.access_token;
+    if (!accessToken) {
+      setCustomerError('Sessao expirada. Faca login novamente.');
+      return;
+    }
+
+    setCustomerActionLoading(customerId);
+
+    try {
+      const response = await fetch(`${API_URL}/v1/admin/customers/${customerId}/send-password-reset`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
+
+      const payload = await parseJsonSafe<{ message?: string }>(response);
+
+      if (!response.ok) {
+        setCustomerError(payload?.message ?? 'Nao foi possivel enviar o email de troca de senha.');
+        return;
+      }
+
+      setCustomerError(null);
+      window.alert('Email de recuperacao enviado para o cliente.');
+    } catch (error) {
+      setCustomerError(error instanceof Error ? error.message : 'Erro inesperado ao enviar email de troca de senha.');
+    } finally {
+      setCustomerActionLoading(null);
+    }
   };
 
   if (sessionLoading) {
@@ -496,6 +803,32 @@ export function App() {
                 />
               </label>
 
+              <label className="field">
+                <span>E-mail de acesso SaaS</span>
+                <input
+                  type="email"
+                  placeholder="cliente@empresa.com"
+                  value={customerForm.saas_email}
+                  onChange={(event) => {
+                    const value = event.currentTarget.value;
+                    setCustomerForm((current) => ({ ...current, saas_email: value }));
+                  }}
+                />
+              </label>
+
+              <label className="field">
+                <span>Senha de acesso SaaS</span>
+                <input
+                  type="password"
+                  placeholder="Minimo 6 caracteres"
+                  value={customerForm.saas_password}
+                  onChange={(event) => {
+                    const value = event.currentTarget.value;
+                    setCustomerForm((current) => ({ ...current, saas_password: value }));
+                  }}
+                />
+              </label>
+
               {customerError ? <p className="error">{customerError}</p> : null}
 
               <button className="btn" disabled={plans.length === 0} type="submit">
@@ -516,10 +849,119 @@ export function App() {
 
                 return (
                   <div className="list-row list-row-column" key={customer.id}>
-                    <p className="strong">{customer.name}</p>
-                    <p className="muted">Plano: {plan?.name ?? 'Plano removido'}</p>
-                    <p className="muted">Vencimento: {new Date(`${customer.due_date}T00:00:00`).toLocaleDateString('pt-BR')}</p>
-                    <p className="muted">Contato: {customer.contact}</p>
+                    {editingCustomerId === customer.id ? (
+                      <div className="stack" style={{ width: '100%' }}>
+                        <label className="field">
+                          <span>Nome</span>
+                          <input
+                            type="text"
+                            value={editingCustomerForm.name}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value;
+                              setEditingCustomerForm((current) => ({ ...current, name: value }));
+                            }}
+                          />
+                        </label>
+
+                        <label className="field">
+                          <span>Plano</span>
+                          <select
+                            value={editingCustomerForm.plan_id}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value;
+                              setEditingCustomerForm((current) => ({ ...current, plan_id: value }));
+                            }}
+                          >
+                            <option value="">Selecione um plano</option>
+                            {plans.map((itemPlan) => (
+                              <option key={itemPlan.id} value={itemPlan.id}>
+                                {itemPlan.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+
+                        <label className="field">
+                          <span>Data de vencimento</span>
+                          <input
+                            type="date"
+                            value={editingCustomerForm.due_date}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value;
+                              setEditingCustomerForm((current) => ({ ...current, due_date: value }));
+                            }}
+                          />
+                        </label>
+
+                        <label className="field">
+                          <span>Contato</span>
+                          <input
+                            type="text"
+                            value={editingCustomerForm.contact}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value;
+                              setEditingCustomerForm((current) => ({ ...current, contact: value }));
+                            }}
+                          />
+                        </label>
+
+                        <label className="field">
+                          <span>E-mail SaaS</span>
+                          <input
+                            type="email"
+                            value={editingCustomerForm.saas_email}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value;
+                              setEditingCustomerForm((current) => ({ ...current, saas_email: value }));
+                            }}
+                          />
+                        </label>
+
+                        <div className="topbar-actions" style={{ justifyContent: 'flex-start' }}>
+                          <button
+                            className="btn"
+                            type="button"
+                            disabled={customerActionLoading === customer.id}
+                            onClick={() => void handleSaveCustomerEdit(customer.id)}
+                          >
+                            Salvar
+                          </button>
+                          <button
+                            className="btn btn-light"
+                            type="button"
+                            onClick={cancelEditingCustomer}
+                          >
+                            Cancelar
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="strong">{customer.name}</p>
+                        <p className="muted">Plano: {plan?.name ?? 'Plano removido'}</p>
+                        <p className="muted">Vencimento: {new Date(`${customer.due_date}T00:00:00`).toLocaleDateString('pt-BR')}</p>
+                        <p className="muted">Contato: {customer.contact}</p>
+                        <p className="muted">E-mail SaaS: {customer.saas_email || '-'}</p>
+
+                        <div className="topbar-actions" style={{ justifyContent: 'flex-start' }}>
+                          <button
+                            className="btn btn-light"
+                            type="button"
+                            onClick={() => startEditingCustomer(customer)}
+                          >
+                            Editar
+                          </button>
+                          <button
+                            className="btn"
+                            type="button"
+                            disabled={customerActionLoading === customer.id}
+                            onClick={() => void handleSendResetPassword(customer.id)}
+                          >
+                            Enviar email troca senha
+                          </button>
+                        </div>
+                      </>
+                    )}
                   </div>
                 );
               })}
